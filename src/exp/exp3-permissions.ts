@@ -1,10 +1,16 @@
 /**
- * 在实验1的基础上增加三个基础工具： read_file / write_file / run_bash
+ * 在实验2的基础上增加权限层
+ * 
+ * 检验
+ * 1. 让它read_file 自动放行
+ * 2. 让它run_bash 提示Y/n
+ * 3. 用 --allow "ls*"
+ * 
  */
 
 import OpenAI from "openai";
 import * as fs from "node:fs/promises";
-import { readInput } from "./input.js";
+import { readInput } from "../input.js";
 
 const client = new OpenAI({
     baseURL: "http://localhost:11434/v1",

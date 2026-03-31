@@ -1,5 +1,5 @@
 import { OpenAI } from 'openai';
-import { readInput } from './input.js';
+import { readInput } from '../input.js';
 // 配置区
 const client = new OpenAI({
     baseURL: "http://localhost:11434/v1",
