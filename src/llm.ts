@@ -68,11 +68,44 @@ export function setVerbose(v: boolean) {
   verbose = v;
 }
 
+// ──────────────────────────────────────────────
+// Phase 1 新增: 重试配置
+// ──────────────────────────────────────────────
+// 
+// 为什么需要重试？
+// 网络会断，Ollama会偶尔返回500， 模型加载中会返回503
+// 这些是"暂时性故障"，等一下再试就好了。
+// 但有些错误不应该重试：400（你的请求格式有问题）
+//
+// 策略叫"指数退避"：第一次等 1 秒，第二次等 2 秒，
+// 第三次等 4 秒。
+
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000;
+
+/** 判断一个 HTTP 状态码是否值得重试 */
+function isRetryable(status: number): boolean {
+    // 429 = 太多请求（rate limit）
+    // 500 = 服务器内部错误，可能是暂时的
+    // 502/503/504 = 网关/服务不可用，通常是暂时的
+    return [429, 500, 502, 503, 504].includes(status);
+}
+
+/** 等待指定毫秒 */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * 发送消息给 LLM，返回助手的回复。
  *
  * 重要：这个函数只负责 "一次来回"。
  * 工具调用的循环逻辑在 main.ts 里。
+ * 
+ * Phase 1 改动:
+ * - 增加重试
+ * - 增加响应 JSON 解析保护
+ * - 增加空回复兜底
  */
 export async function chat(
   messages: Message[],
@@ -95,51 +128,83 @@ export async function chat(
     console.log("└──────────────────────────────────────────\n");
   }
 
-  // ── 发送 HTTP 请求 ──
+  // ── 带重试的 HTTP 请求 ──
   //
   // 就这么简单。Tool Calling 不是什么魔法，
   // 它就是一个 HTTP POST，body 里带了 tools 数组。
   // LLM 看到 tools 定义后，会在回复中选择调用某个工具，
   // 或者直接回复文本。
 
-  let response: Response;
-  try {
-    response = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    });
-  } catch (err) {
-    throw new Error(
-      `Cannot connect to Ollama at ${OLLAMA_BASE_URL}\n` +
-        `Make sure Ollama is running: ollama serve\n` +
-        `Original error: ${(err as Error).message}`
-    );
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+        console.log(
+            `\x1b[33m⏳ Retry ${attempt}/${MAX_RETRIES} in ${delay}ms...\x1b[0m`
+        );
+        await sleep(delay);
+    }
+
+    let response: Response;
+    try {
+        response = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+        });
+    } catch (err) {
+        lastError = new Error(
+        `Cannot connect to Ollama at ${OLLAMA_BASE_URL}\n` +
+            `Make sure Ollama is running: ollama serve\n` +
+            `Original error: ${(err as Error).message}`
+        );
+        continue;
+    }
+
+    if (!response.ok) {
+        const text = await response.text();
+        lastError = new Error(`Ollama returned ${response.status}: ${text.slice(0, 200)}`);
+
+        if (isRetryable(response.status)) {
+            continue;
+        }
+        
+        throw lastError;
+    }
+
+    // 解析响应 JSON
+    //
+    // Phase 1 新增保护: response.json() 
+    let data: ChatResponse;
+    try {
+        data = (await response.json()) as ChatResponse;
+    } catch {
+        lastError = new Error(
+            "LLM returned invalid JSON. The response may have been truncated."
+        );
+        continue;
+    }
+
+    if (verbose) {
+        console.log("\n┌─── 📥 RESPONSE FROM LLM ────────────────");
+        console.log(JSON.stringify(data, null, 2));
+        console.log("└──────────────────────────────────────────\n");
+    }
+
+    // ── 解析响应 ──
+    const choice = data.choices?.[0];
+    if (!choice) {
+      throw new Error("LLM returned empty response");
+    }
+
+    return {
+      content: choice.message.content,
+      toolCalls: choice.message.tool_calls ?? [],
+    };
   }
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Ollama returned ${response.status}: ${text}`);
-  }
-
-  const data = (await response.json()) as ChatResponse;
-
-  if (verbose) {
-    console.log("\n┌─── 📥 RESPONSE FROM LLM ────────────────");
-    console.log(JSON.stringify(data, null, 2));
-    console.log("└──────────────────────────────────────────\n");
-  }
-
-  // ── 解析响应 ──
-  const choice = data.choices?.[0];
-  if (!choice) {
-    throw new Error("LLM returned empty response");
-  }
-
-  return {
-    content: choice.message.content,
-    toolCalls: choice.message.tool_calls ?? [],
-  };
+  
+  throw lastError ?? new Error("All retry attempts exhausted");
 }
 
 /** 返回当前配置的模型名 */
