@@ -1,0 +1,21 @@
+{
+  "name": "myagent",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "exp1": "npx tsx src/exp1-loop.ts",
+    "exp2": "npx tsx src/exp2-tools.ts",
+    "exp3": "npx tsx src/exp3-permissions.ts",
+    "exp4": "npx tsx src/exp4-context.ts",
+    "exp5": "npx tsx src/exp5-sessions.ts"
+  },
+  "dependencies": {
+    "minimatch": "^10.2.5",
+    "openai": "^4.77.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
