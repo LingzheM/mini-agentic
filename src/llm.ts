@@ -13,7 +13,7 @@ import { ToolDefinition, ToolCall } from "./tools.js";
 
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434";
 
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'qwen2.5:7b';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'qwen2.5-coder:7b';
 
 // 消息类型
 export type Message =
