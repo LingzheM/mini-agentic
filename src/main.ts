@@ -26,7 +26,7 @@
  */
 
 import * as readline from "readline";
-import { chat, setVerbose, getModelName, getBaseUrl, type Message } from "./llm.js";
+import { chat, setVerbose, getModelName, getBaseUrl, type Message, chatStream } from "./llm.js";
 import { TOOL_DEFINITIONS, executeTool } from "./tools.js";
 
 // ──────────────────────────────────────────────
@@ -65,7 +65,11 @@ RULES:
 4. When writing code, follow best practices for the language.
 5. Never run destructive commands (rm -rf /, etc.) without explicit confirmation.
 6. Keep responses concise. You're in a terminal, not a chat UI.
-7. Always respond in the same language the user uses.`;
+7. Always respond in the same language the user uses.
+8. Only use tools when the task genuinely requires file access or shell execution. 
+  For explanations, definitions, or conceptual questions, answer directly without tools.
+`;
+
 
 // ──────────────────────────────────────────────
 // 对话历史
@@ -138,8 +142,22 @@ async function handleUserInput(userMessage: string): Promise<void> {
 
     // 2a. 调用 LLM
     let response;
+    let streamedContent = false;
     try {
-      response = await chat(conversationHistory, TOOL_DEFINITIONS);
+      response = await chatStream(
+        conversationHistory, 
+        TOOL_DEFINITIONS,
+        (token: string) => {
+          if (!streamedContent) {
+            process.stdout.write(`\n${c.cyan}`);
+            streamedContent = true;
+          }
+          process.stdout.write(token);
+        }
+      );
+      if (streamedContent) {
+        process.stdout.write(`${c.reset}\n`);
+      }
     } catch (err) {
       console.error(
         `\n${c.red}✗ LLM call failed: ${(err as Error).message}${c.reset} `
@@ -166,15 +184,12 @@ async function handleUserInput(userMessage: string): Promise<void> {
         content: response.content,
         tool_calls: response.toolCalls,
       });
-      
-      if (response.content) {
-        console.log(`\n${c.cyan}${response.content}${c.reset}`);
-      }
 
       // 逐个执行工具
       for (const toolCall of response.toolCalls) {
         const toolName = toolCall.function.name;
         const toolArgs = toolCall.function.arguments;
+        toolCallCount++;
 
         // 显示正在做什么
         console.log(
