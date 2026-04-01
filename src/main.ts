@@ -79,6 +79,8 @@ const conversationHistory: Message[] = [
   { role: "system", content: SYSTEM_PROMPT },
 ];
 
+const MAX_TOOL_CALLS_PER_TURN = 20;
+
 // ──────────────────────────────────────────────
 // Agent Loop — 整个项目的核心
 // ──────────────────────────────────────────────
@@ -99,10 +101,53 @@ async function handleUserInput(userMessage: string): Promise<void> {
   // 1. 把用户消息加入历史
   conversationHistory.push({ role: "user", content: userMessage });
 
+  // 记录本轮工具调用次数
+  let toolCallCount = 0;
+
   // 2. 进入 Agent Loop
   while (true) {
+    // 如果已经调用了太多次工具，强制停下来。
+    // 关键：我们不是直接crash，而是把"你调用太多次了"
+    // 作为一条用户消息喂给LLM，让它自己总结并停止
+    if (toolCallCount >= MAX_TOOL_CALLS_PER_TURN) {
+      console.log(
+        `\n${c.yellow} Circuit breaker: ${toolCallCount} tool calls reached.${c.reset}`
+      );
+      console.log(
+        `${c.dim} Asking LLM to wrap up...${c.reset}`
+      );
+      conversationHistory.push({
+        role: "user",
+        content: 
+          "[SYSTEM] You have used too many tool calls in this turn. " +
+          "Please summarize what you've done so far and what remains. " +
+          "Do NOT call any more tools.",
+      });
+      // 不break——让LLM看到这条消息后自己回复纯文本
+      // 把 tools 设为空数组，防止继续调用
+      const wrapUpResponse = await chat(conversationHistory, []);
+      if (wrapUpResponse.content) {
+        conversationHistory.push({
+          role: "assistant",
+          content: wrapUpResponse.content,
+        });
+        console.log(`\n${c.cyan}${wrapUpResponse.content}${c.reset}`);
+      }
+      break;
+    }
+
     // 2a. 调用 LLM
-    const response = await chat(conversationHistory, TOOL_DEFINITIONS);
+    let response;
+    try {
+      response = await chat(conversationHistory, TOOL_DEFINITIONS);
+    } catch (err) {
+      console.error(
+        `\n${c.red}✗ LLM call failed: ${(err as Error).message}${c.reset} `
+      );
+      // 从历史中移除最后的未完成状态（如果有）
+      // 让对话历史停留在最后一个完整状态
+      break;
+    }
 
     // 2b. 检查 LLM 是否想调用工具
     if (response.toolCalls.length > 0) {
@@ -121,6 +166,10 @@ async function handleUserInput(userMessage: string): Promise<void> {
         content: response.content,
         tool_calls: response.toolCalls,
       });
+      
+      if (response.content) {
+        console.log(`\n${c.cyan}${response.content}${c.reset}`);
+      }
 
       // 逐个执行工具
       for (const toolCall of response.toolCalls) {
@@ -129,7 +178,7 @@ async function handleUserInput(userMessage: string): Promise<void> {
 
         // 显示正在做什么
         console.log(
-          `\n${c.yellow}⚡ Tool: ${c.bold}${toolName}${c.reset}`
+          `\n${c.yellow}⚡ Tool [${toolCallCount}/${MAX_TOOL_CALLS_PER_TURN}]: ${c.bold}${toolName}${c.reset}`
         );
         console.log(`${c.dim}   Args: ${toolArgs}${c.reset}`);
 
@@ -154,6 +203,13 @@ async function handleUserInput(userMessage: string): Promise<void> {
 
       // 继续循环，让 LLM 处理工具结果
       continue;
+    }
+
+    if (!response.content && response.toolCalls.length === 0) {
+      console.log(
+        `\n${c.dim}(LLM returned an empty response - this sometimes happens. Try rephrasing.)${c.reset}`
+      );
+      break;
     }
 
     // ──── 纯文本回复分支 ────

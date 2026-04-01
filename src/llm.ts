@@ -25,7 +25,7 @@ const OLLAMA_BASE_URL =
   process.env.OLLAMA_URL ?? "http://localhost:11434";
 
 const OLLAMA_MODEL =
-  process.env.OLLAMA_MODEL ?? "qwen2.5:7b";
+  process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
 
 // ──────────────────────────────────────────────
 // 消息类型（OpenAI Chat Completion 格式）
