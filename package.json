@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "npx tsx src/main.ts --verbose",
+    "dev": "npx tsx src/main.ts",
+    "dev:verbose": "npx tsx src/main.ts --verbose",
+
     "exp1": "npx tsx src/exp1-loop.ts",
     "exp2": "npx tsx src/exp2-tools.ts",
     "exp3": "npx tsx src/exp3-permissions.ts",
