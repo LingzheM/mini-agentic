@@ -26,7 +26,7 @@
  */
 
 import * as readline from "readline";
-import { chat, setVerbose, getModelName, getBaseUrl, type Message, chatStream } from "./llm.js";
+import { chat, chatStream, setVerbose, getModelName, getBaseUrl, type Message } from "./llm.js";
 import { TOOL_DEFINITIONS, executeTool } from "./tools.js";
 
 // ──────────────────────────────────────────────
@@ -56,7 +56,13 @@ const c = {
 // 试试修改这个 prompt，看 AI 行为怎么变化！
 
 const SYSTEM_PROMPT = `You are Mini Claude Code, a coding assistant that runs in the user's terminal.
-You have access to tools that let you read files, write files, and run shell commands.
+You have access to tools that let you read files, write files, search code, and run shell commands.
+
+TOOL SELECTION:
+- To understand a codebase: start with grep_search to find relevant code, then read_file on specific files.
+- To edit existing files: use search_and_replace with the exact text to find and its replacement.
+  Only use write_file for creating NEW files or when you need to rewrite an entire file from scratch.
+- To run tests, install packages, or check status: use run_command.
 
 RULES:
 1. Before using a tool, briefly explain what you're about to do and why.
@@ -66,10 +72,7 @@ RULES:
 5. Never run destructive commands (rm -rf /, etc.) without explicit confirmation.
 6. Keep responses concise. You're in a terminal, not a chat UI.
 7. Always respond in the same language the user uses.
-8. Only use tools when the task genuinely requires file access or shell execution. 
-  For explanations, definitions, or conceptual questions, answer directly without tools.
-`;
-
+8. When search_and_replace fails because old_text wasn't found, read the file first to see the actual content, then retry with the correct text.`;
 
 // ──────────────────────────────────────────────
 // 对话历史
@@ -83,52 +86,63 @@ const conversationHistory: Message[] = [
   { role: "system", content: SYSTEM_PROMPT },
 ];
 
+// ──────────────────────────────────────────────
+// Phase 1 新增：Agent Loop 安全限制
+// ──────────────────────────────────────────────
+//
+// 为什么需要断路器？
+// 想象这个场景：LLM 调用 read_file → 看到结果 → 决定再读另一个文件
+// → 看到结果 → 又要读另一个…… 如果 LLM "糊涂"了，
+// 这个循环可能永远不停。
+//
+// 断路器说：超过 N 次工具调用，强制停下来，问用户怎么办。
+// 20 次对于大多数任务已经很充裕了（读几个文件、改几个文件、跑测试）。
+
 const MAX_TOOL_CALLS_PER_TURN = 20;
 
 // ──────────────────────────────────────────────
-// Agent Loop — 整个项目的核心
+// Agent Loop — 整个项目的核心（Phase 1 加固版）
 // ──────────────────────────────────────────────
 
 /**
  * 处理一次用户输入，可能触发多轮工具调用。
  *
- * 为什么是 while 循环？
- * 因为 LLM 可能需要连续调用多个工具。比如：
- *   1. "帮我创建一个 React 组件"
- *   2. LLM: 我先看看项目结构 → 调用 run_command("ls")
- *   3. 我们把 ls 结果喂回去
- *   4. LLM: 看到了，现在创建文件 → 调用 write_file(...)
- *   5. 我们把写入结果喂回去
- *   6. LLM: "好了，我帮你创建了组件！" → 纯文本，循环结束
+ * Phase 1 改动：
+ * - 加了循环断路器（MAX_TOOL_CALLS_PER_TURN）
+ * - 处理 LLM 返回空回复的情况
+ * - 工具调用解析错误不再 crash，而是喂回给 LLM 让它自己修正
+ * - 整个 Agent Loop 的错误不会污染对话历史
  */
 async function handleUserInput(userMessage: string): Promise<void> {
   // 1. 把用户消息加入历史
   conversationHistory.push({ role: "user", content: userMessage });
 
-  // 记录本轮工具调用次数
+  // Phase 1 新增：记录本轮工具调用次数
   let toolCallCount = 0;
 
   // 2. 进入 Agent Loop
   while (true) {
+    // ── Phase 1 新增：断路器检查 ──
+    //
     // 如果已经调用了太多次工具，强制停下来。
-    // 关键：我们不是直接crash，而是把"你调用太多次了"
-    // 作为一条用户消息喂给LLM，让它自己总结并停止
+    // 关键：我们不是直接 crash，而是把"你调用太多次了"
+    // 作为一条用户消息喂给 LLM，让它自己总结并停止。
     if (toolCallCount >= MAX_TOOL_CALLS_PER_TURN) {
       console.log(
-        `\n${c.yellow} Circuit breaker: ${toolCallCount} tool calls reached.${c.reset}`
+        `\n${c.yellow}⚠ Circuit breaker: ${toolCallCount} tool calls reached.${c.reset}`
       );
       console.log(
-        `${c.dim} Asking LLM to wrap up...${c.reset}`
+        `${c.dim}  Asking LLM to wrap up...${c.reset}`
       );
       conversationHistory.push({
         role: "user",
-        content: 
+        content:
           "[SYSTEM] You have used too many tool calls in this turn. " +
           "Please summarize what you've done so far and what remains. " +
           "Do NOT call any more tools.",
       });
-      // 不break——让LLM看到这条消息后自己回复纯文本
-      // 把 tools 设为空数组，防止继续调用
+      // 不 break——让 LLM 看到这条消息后自己回复纯文本
+      // 但把 tools 设为空数组，防止它继续调用
       const wrapUpResponse = await chat(conversationHistory, []);
       if (wrapUpResponse.content) {
         conversationHistory.push({
@@ -140,14 +154,22 @@ async function handleUserInput(userMessage: string): Promise<void> {
       break;
     }
 
-    // 2a. 调用 LLM
+    // 2a. 调用 LLM（Phase 2: 流式输出）
+    //
+    // Phase 0/1: chat() → 等全部生成完 → 一次性打印
+    // Phase 2:   chatStream() → 每个 token 到达 → 立刻打印
+    //
+    // onToken 回调：LLM 每生成一个 token 就调用一次。
+    // 我们用 process.stdout.write 而不是 console.log，
+    // 因为 console.log 会自动加换行，而我们需要逐字追加。
     let response;
-    let streamedContent = false;
+    let streamedContent = false; // 是否已经开始打印流式文本
     try {
       response = await chatStream(
-        conversationHistory, 
+        conversationHistory,
         TOOL_DEFINITIONS,
         (token: string) => {
+          // 第一个 token 到达时，打印颜色前缀
           if (!streamedContent) {
             process.stdout.write(`\n${c.cyan}`);
             streamedContent = true;
@@ -155,35 +177,36 @@ async function handleUserInput(userMessage: string): Promise<void> {
           process.stdout.write(token);
         }
       );
+      // 流式文本结束后，关闭颜色并换行
       if (streamedContent) {
         process.stdout.write(`${c.reset}\n`);
       }
     } catch (err) {
+      // Phase 1 新增：API 调用失败时的恢复策略
+      //
+      // 旧代码：错误直接抛到最外层，用户只看到一个红色错误。
+      // 新代码：如果是在工具调用循环中间失败的，
+      //         我们保持对话历史一致，告诉用户出了什么问题，
+      //         但不丢弃已经做过的工作。
       console.error(
-        `\n${c.red}✗ LLM call failed: ${(err as Error).message}${c.reset} `
+        `\n${c.red}✗ LLM call failed: ${(err as Error).message}${c.reset}`
       );
       // 从历史中移除最后的未完成状态（如果有）
-      // 让对话历史停留在最后一个完整状态
+      // 让对话历史停在最后一个完整状态
       break;
     }
 
     // 2b. 检查 LLM 是否想调用工具
     if (response.toolCalls.length > 0) {
-      // ──── 工具调用分支 ────
-      //
-      // LLM 没有直接回答，而是说："我想用某个工具"。
-      // 我们需要：
-      //   1. 把 LLM 的工具调用请求记入历史
-      //   2. 真正执行工具
-      //   3. 把执行结果记入历史
-      //   4. 回到循环顶部，让 LLM 看到结果后继续
-
       // 记录 LLM 的回复（包含 tool_calls）
       conversationHistory.push({
         role: "assistant",
         content: response.content,
         tool_calls: response.toolCalls,
       });
+
+      // Phase 2 注意：如果 LLM 在工具调用之前说了话，
+      // streaming 已经通过 onToken 实时打印了，这里不需要再打印。
 
       // 逐个执行工具
       for (const toolCall of response.toolCalls) {
@@ -207,8 +230,7 @@ async function handleUserInput(userMessage: string): Promise<void> {
             : result;
         console.log(`${c.dim}   Result: ${preview}${c.reset}`);
 
-        // 把工具结果加入历史——这是关键！
-        // role: "tool" 告诉 LLM "这是你要求调用的工具的返回结果"
+        // 把工具结果加入历史
         conversationHistory.push({
           role: "tool",
           tool_call_id: toolCall.id,
@@ -220,24 +242,26 @@ async function handleUserInput(userMessage: string): Promise<void> {
       continue;
     }
 
+    // ── Phase 1 新增：处理"空回复" ──
+    //
+    // 有时候 LLM 返回既没有 content 也没有 tool_calls 的空回复。
+    // 旧代码：静默，然后 break，用户什么都看不到。
+    // 新代码：告诉用户发生了什么，然后优雅退出。
     if (!response.content && response.toolCalls.length === 0) {
       console.log(
-        `\n${c.dim}(LLM returned an empty response - this sometimes happens. Try rephrasing.)${c.reset}`
+        `\n${c.dim}(LLM returned an empty response — this sometimes happens. Try rephrasing.)${c.reset}`
       );
       break;
     }
 
     // ──── 纯文本回复分支 ────
-    //
-    // LLM 没有调用工具，直接给了文字回答。
-    // 这意味着它"完成了"当前任务。
-
+    // Phase 2：文字已经通过 streaming 实时打印了，
+    // 这里只需要记入历史，不需要再 console.log。
     if (response.content) {
       conversationHistory.push({
         role: "assistant",
         content: response.content,
       });
-      console.log(`\n${c.cyan}${response.content}${c.reset}`);
     }
 
     // 跳出 Agent Loop，等待用户下一次输入
@@ -260,12 +284,13 @@ async function main(): Promise<void> {
   console.log(`
 ${c.cyan}${c.bold}╔══════════════════════════════════════╗
 ║        🤖 Mini Claude Code          ║
-║     Phase 1: The Tool Caller        ║
+║     Phase 3: The Right Tool          ║
 ╚══════════════════════════════════════╝${c.reset}
 
 ${c.dim}Model:    ${getModelName()}
 Ollama:   ${getBaseUrl()}
-Tools:    read_file, write_file, run_command
+Tools:    read_file, write_file, search_and_replace, grep_search, run_command
+Stream:   ON (tokens print as they arrive)
 Verbose:  ${process.argv.includes("--verbose") ? "ON" : "OFF (use --verbose to see raw JSON)"}
 
 Type your request. Use Ctrl+C to exit.${c.reset}
