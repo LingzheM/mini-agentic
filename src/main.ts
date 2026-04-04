@@ -28,6 +28,7 @@
 import * as readline from "readline";
 import { chat, chatStream, setVerbose, getModelName, getBaseUrl, type Message } from "./llm.js";
 import { TOOL_DEFINITIONS, executeTool } from "./tools.js";
+import { checkPermission, setTrustMode } from "./permissions.js";
 
 // ──────────────────────────────────────────────
 // ANSI 颜色（零依赖的终端美化）
@@ -57,6 +58,15 @@ const c = {
 
 const SYSTEM_PROMPT = `You are Mini Claude Code, a coding assistant that runs in the user's terminal.
 You have access to tools that let you read files, write files, search code, and run shell commands.
+
+WORKING DIRECTORY: ${process.cwd()}
+All relative paths resolve from this directory. When the user asks to create a file without specifying a path, create it here.
+
+PERMISSIONS:
+- Read tools (read_file, grep_search) execute automatically.
+- Write tools (write_file, search_and_replace) require user approval before executing.
+- Exec tools (run_command) always require user approval.
+- If the user denies a tool call, do NOT retry it. Ask the user what they'd prefer instead.
 
 TOOL SELECTION:
 - To understand a codebase: start with grep_search to find relevant code, then read_file on specific files.
@@ -220,7 +230,37 @@ async function handleUserInput(userMessage: string): Promise<void> {
         );
         console.log(`${c.dim}   Args: ${toolArgs}${c.reset}`);
 
-        // 执行！
+        // ── Phase 4 新增：权限检查 ──
+        //
+        // 在 LLM 的"决定"和真正的"执行"之间插入一道关卡。
+        // checkPermission 会根据工具的风险等级决定：
+        //   - read 工具 → 自动通过
+        //   - write/exec 工具 → 询问用户 [y/n]
+        //
+        // 如果用户拒绝了怎么办？
+        // 我们不是直接跳过——那样 LLM 会困惑（它期待一个工具结果）。
+        // 我们把"用户拒绝了"作为工具结果喂回给 LLM，
+        // 让它知道这条路走不通，自己想别的办法。
+        // 这和 Phase 1 的"错误消息喂回 LLM"是同一个模式。
+        const allowed = await checkPermission(toolName, toolArgs);
+
+        if (!allowed) {
+          console.log(`${c.red}   ✗ Denied by user${c.reset}`);
+
+          // 把拒绝结果喂给 LLM——让它知道要换个方案
+          conversationHistory.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content:
+              `The user denied permission to execute "${toolName}". ` +
+              `Do NOT retry the same operation. ` +
+              `Either explain what you wanted to do and ask the user for guidance, ` +
+              `or try an alternative approach.`,
+          });
+          continue; // 跳过执行，处理下一个 tool call
+        }
+
+        // 执行！（用户已确认或自动通过）
         const result = await executeTool(toolName, toolArgs);
 
         // 显示结果（截断过长的输出）
@@ -274,23 +314,37 @@ async function handleUserInput(userMessage: string): Promise<void> {
 // ──────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  // 处理 --verbose 标志
+  // 处理命令行标志
   if (process.argv.includes("--verbose")) {
     setVerbose(true);
     console.log(`${c.dim}(verbose mode: showing raw JSON)${c.reset}\n`);
+  }
+
+  // Phase 4 新增：信任模式
+  //
+  // --trust 跳过所有权限确认。
+  // 类似 Claude Code 的 --dangerously-skip-permissions。
+  // 名字故意简短——用的人知道自己在做什么。
+  const isTrustMode = process.argv.includes("--trust");
+  if (isTrustMode) {
+    setTrustMode(true);
+    console.log(
+      `${c.yellow}⚠ Trust mode: all tool calls will execute without confirmation${c.reset}\n`
+    );
   }
 
   // 启动画面
   console.log(`
 ${c.cyan}${c.bold}╔══════════════════════════════════════╗
 ║        🤖 Mini Claude Code          ║
-║     Phase 3: The Right Tool          ║
+║    Phase 4: Human in the Loop       ║
 ╚══════════════════════════════════════╝${c.reset}
 
 ${c.dim}Model:    ${getModelName()}
 Ollama:   ${getBaseUrl()}
 Tools:    read_file, write_file, search_and_replace, grep_search, run_command
 Stream:   ON (tokens print as they arrive)
+Perms:    ${isTrustMode ? "TRUST MODE (all auto-approved)" : "ON (write/exec tools require approval)"}
 Verbose:  ${process.argv.includes("--verbose") ? "ON" : "OFF (use --verbose to see raw JSON)"}
 
 Type your request. Use Ctrl+C to exit.${c.reset}
