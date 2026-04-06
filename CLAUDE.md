@@ -1,0 +1,4 @@
+- 请用中文回复
+- 代码注释也用中文
+- 本项目使用 2 空格缩进
+- commit message 格式：feat: / fix: / docs:
