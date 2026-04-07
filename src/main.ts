@@ -29,6 +29,12 @@ import * as readline from "readline";
 import { chat, chatStream, setVerbose, getModelName, getBaseUrl, type Message } from "./llm.js";
 import { TOOL_DEFINITIONS, executeTool } from "./tools.js";
 import { checkPermission, setTrustMode } from "./permissions.js";
+import {
+  estimateHistoryTokens,
+  compactIfNeeded,
+  truncateToolResult,
+  getContextConfig,
+} from "./context-manager.js";
 
 // ──────────────────────────────────────────────
 // ANSI 颜色（零依赖的终端美化）
@@ -369,7 +375,22 @@ async function handleUserInput(userMessage: string): Promise<void> {
       break;
     }
 
-    // 2a. 调用 LLM（Phase 2: 流式输出）
+    // 2a. Phase 6 新增：上下文窗口管理
+    //
+    // 在每次调用 LLM 之前，检查 conversationHistory
+    // 的 token 总量是否接近上限。如果是，压缩中间的旧消息。
+    //
+    // 为什么在这里检查而不是在别处？
+    // 因为这是调用 API 的最后一道门。不管历史怎么被修改
+    // （用户输入、工具结果、错误消息），到这里统一检查一次。
+    const compactResult = compactIfNeeded(conversationHistory);
+    if (compactResult.compacted) {
+      console.log(
+        `\n${c.magenta}♻ Context compacted: ${compactResult.tokensBefore} → ${compactResult.tokensAfter} tokens${c.reset}`
+      );
+    }
+
+    // 2b. 调用 LLM（Phase 2: 流式输出）
     //
     // Phase 0/1: chat() → 等全部生成完 → 一次性打印
     // Phase 2:   chatStream() → 每个 token 到达 → 立刻打印
@@ -466,16 +487,27 @@ async function handleUserInput(userMessage: string): Promise<void> {
         }
 
         // 执行！（用户已确认或自动通过）
-        const result = await executeTool(toolName, toolArgs);
+        const rawResult = await executeTool(toolName, toolArgs);
 
-        // 显示结果（截断过长的输出）
+        // Phase 6 新增：预截断工具结果
+        //
+        // 工具结果是最大的 token 消耗者。
+        // 一次 read_file 读 500 行 = 几千 token。
+        // 如果不截断，几轮工具调用就撑满 context window。
+        //
+        // 截断策略：保留头部 70% + 尾部 20%，中间标注省略。
+        // 为什么保留头尾？文件的开头（import/声明）和结尾（export）
+        // 通常是 LLM 最需要看的部分。
+        const result = truncateToolResult(rawResult);
+
+        // 显示结果（终端预览更短，只显示 500 字符）
         const preview =
-          result.length > 500
-            ? result.slice(0, 500) + `\n... (${result.length} chars total)`
-            : result;
+          rawResult.length > 500
+            ? rawResult.slice(0, 500) + `\n... (${rawResult.length} chars total)`
+            : rawResult;
         console.log(`${c.dim}   Result: ${preview}${c.reset}`);
 
-        // 把工具结果加入历史
+        // 把截断后的工具结果加入历史
         conversationHistory.push({
           role: "tool",
           tool_call_id: toolCall.id,
@@ -560,12 +592,13 @@ async function main(): Promise<void> {
   console.log(`
 ${c.cyan}${c.bold}╔══════════════════════════════════════╗
 ║        🤖 Mini Claude Code          ║
-║   Phase 5: Prompt is the Product    ║
+║   Phase 6: Memory is Finite          ║
 ╚══════════════════════════════════════╝${c.reset}
 
 ${c.dim}Model:    ${getModelName()}
 Ollama:   ${getBaseUrl()}
 CWD:      ${cwd}
+Context:  ${getContextConfig().maxTokens} tokens max (compact at ${Math.round(getContextConfig().compactThreshold * 100)}%)
 Tools:    read_file, write_file, search_and_replace, grep_search, run_command
 Perms:    ${isTrustMode ? "TRUST MODE (all auto-approved)" : "ON (write/exec require approval)"}
 CLAUDE.md:${hasClaudeMd ? " loaded ✓" : ` not found ${c.reset}${c.dim}(create one to set project rules)`}
