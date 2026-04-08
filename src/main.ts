@@ -35,6 +35,14 @@ import {
   truncateToolResult,
   getContextConfig,
 } from "./context-manager.js";
+import {
+  saveSession,
+  loadSession,
+  listSessions,
+  getLatestSessionId,
+  cleanOldSessions,
+  type SessionInfo,
+} from "./session.js";
 
 // ──────────────────────────────────────────────
 // ANSI 颜色（零依赖的终端美化）
@@ -308,6 +316,16 @@ async function readClaudeMd(cwd: string): Promise<string | null> {
 let conversationHistory: Message[] = [];
 
 // ──────────────────────────────────────────────
+// Phase 7 新增：Session 状态
+// ──────────────────────────────────────────────
+//
+// sessionId 标识当前会话。每轮对话后自动保存。
+// 意外 crash 时最多丢一轮对话，不会丢整个会话。
+
+let currentSessionId: string = "";
+let sessionCreatedAt: string = "";
+
+// ──────────────────────────────────────────────
 // Phase 1 新增：Agent Loop 安全限制
 // ──────────────────────────────────────────────
 //
@@ -577,10 +595,50 @@ async function main(): Promise<void> {
   // LLM 从第一个回复开始就"知道"它在什么项目里。
   const systemPrompt = await buildSystemPrompt();
 
-  // 初始化对话历史
-  conversationHistory = [
-    { role: "system", content: systemPrompt },
-  ];
+  // ── Phase 7 新增：Session 初始化 ──
+  //
+  // 两种启动模式：
+  //   --resume     : 加载最近的（或指定的）session
+  //   (默认)       : 开始新 session
+  //
+  // 不管哪种，system prompt 都是重新构建的。
+  // 只有对话消息从 session 文件恢复。
+
+  const resumeArg = process.argv.find((a) => a.startsWith("--resume"));
+  let resumedFrom: string | null = null;
+
+  if (resumeArg !== undefined) {
+    // --resume 或 --resume=SESSION_ID
+    const explicitId = resumeArg.includes("=")
+      ? resumeArg.split("=")[1]
+      : null;
+    const targetId = explicitId ?? (await getLatestSessionId());
+
+    if (targetId) {
+      const oldMessages = await loadSession(targetId);
+      if (oldMessages) {
+        conversationHistory = [
+          { role: "system", content: systemPrompt },
+          ...oldMessages,
+        ];
+        currentSessionId = targetId;
+        sessionCreatedAt = new Date().toISOString(); // treat as continued
+        resumedFrom = targetId;
+      }
+    }
+  }
+
+  if (!resumedFrom) {
+    // 新 session
+    conversationHistory = [
+      { role: "system", content: systemPrompt },
+    ];
+    currentSessionId = generateId();
+    sessionCreatedAt = new Date().toISOString();
+  }
+
+  // 后台清理旧 session
+  cleanOldSessions().catch(() => {});
 
   // ── 检测到的上下文，显示给用户 ──
   const cwd = process.cwd();
@@ -592,19 +650,19 @@ async function main(): Promise<void> {
   console.log(`
 ${c.cyan}${c.bold}╔══════════════════════════════════════╗
 ║        🤖 Mini Claude Code          ║
-║   Phase 6: Memory is Finite          ║
+║     Phase 7: State Survives         ║
 ╚══════════════════════════════════════╝${c.reset}
 
 ${c.dim}Model:    ${getModelName()}
 Ollama:   ${getBaseUrl()}
 CWD:      ${cwd}
 Context:  ${getContextConfig().maxTokens} tokens max (compact at ${Math.round(getContextConfig().compactThreshold * 100)}%)
-Tools:    read_file, write_file, search_and_replace, grep_search, run_command
+Session:  ${resumedFrom ? `resumed ${resumedFrom} (${conversationHistory.length - 1} msgs)` : `new ${currentSessionId}`}
 Perms:    ${isTrustMode ? "TRUST MODE (all auto-approved)" : "ON (write/exec require approval)"}
-CLAUDE.md:${hasClaudeMd ? " loaded ✓" : ` not found ${c.reset}${c.dim}(create one to set project rules)`}
+CLAUDE.md:${hasClaudeMd ? " loaded ✓" : ` not found`}
 ${projectInfo ? `Project:  ${projectInfo.split("\n")[0].replace("- ", "")}` : "Project:  (no config detected)"}
 
-Type your request. Use Ctrl+C to exit.${c.reset}
+Type your request. Use /help for commands. Ctrl+C to exit.${c.reset}
 `);
 
   if (process.argv.includes("--verbose")) {
@@ -627,8 +685,25 @@ Type your request. Use Ctrl+C to exit.${c.reset}
         return;
       }
 
+      // ── Phase 7 新增：斜杠命令 ──
+      //
+      // 斜杠命令不发给 LLM，由我们的代码直接处理。
+      // 这是 Agent 的"元操作"——操作 Agent 本身，不是操作项目。
+      if (trimmed.startsWith("/")) {
+        await handleSlashCommand(trimmed);
+        prompt();
+        return;
+      }
+
       try {
         await handleUserInput(trimmed);
+
+        // Phase 7 新增：每轮对话后自动保存
+        //
+        // 为什么每轮都存？而不是退出时才存？
+        // 因为用户可能随时 Ctrl+C，或者程序可能 crash。
+        // 每轮存一次意味着最多丢一轮对话。
+        await saveSession(currentSessionId, conversationHistory, sessionCreatedAt);
       } catch (err) {
         console.error(`\n${c.red}Error: ${(err as Error).message}${c.reset}`);
       }
@@ -638,6 +713,107 @@ Type your request. Use Ctrl+C to exit.${c.reset}
   };
 
   prompt();
+}
+
+// ──────────────────────────────────────────────
+// Phase 7 新增：斜杠命令
+// ──────────────────────────────────────────────
+//
+// /sessions — 列出所有保存的会话
+// /resume [id] — 恢复一个旧会话
+// /new — 放弃当前会话，开始新的
+// /help — 显示可用命令
+
+async function handleSlashCommand(input: string): Promise<void> {
+  const parts = input.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  switch (cmd) {
+    case "/sessions": {
+      const sessions = await listSessions();
+      if (sessions.length === 0) {
+        console.log(`${c.dim}  No saved sessions found.${c.reset}`);
+        break;
+      }
+      console.log(`\n${c.bold}  Saved sessions:${c.reset}`);
+      for (const s of sessions.slice(0, 10)) {
+        const isCurrent = s.id === currentSessionId ? ` ${c.green}← current${c.reset}` : "";
+        const date = s.updatedAt.toLocaleString();
+        console.log(
+          `${c.dim}  ${s.id}${c.reset} (${s.messageCount} msgs, ${date})${isCurrent}`
+        );
+        console.log(`${c.dim}    "${s.summary}"${c.reset}`);
+      }
+      console.log();
+      break;
+    }
+
+    case "/resume": {
+      const targetId = parts[1];
+      if (!targetId) {
+        // 没指定 ID → 恢复最近的
+        const latestId = await getLatestSessionId();
+        if (!latestId) {
+          console.log(`${c.dim}  No sessions to resume.${c.reset}`);
+          break;
+        }
+        await resumeSession(latestId);
+      } else {
+        await resumeSession(targetId);
+      }
+      break;
+    }
+
+    case "/new": {
+      const id = generateId();
+      currentSessionId = id;
+      sessionCreatedAt = new Date().toISOString();
+      // 只保留 system prompt
+      conversationHistory = [conversationHistory[0]];
+      console.log(`${c.green}  New session started: ${id}${c.reset}\n`);
+      break;
+    }
+
+    case "/help": {
+      console.log(`
+${c.bold}  Available commands:${c.reset}
+${c.dim}  /sessions       List saved sessions
+  /resume [id]    Resume a session (latest if no id)
+  /new            Start fresh session
+  /help           Show this help${c.reset}
+`);
+      break;
+    }
+
+    default:
+      console.log(`${c.dim}  Unknown command: ${cmd}. Type /help for options.${c.reset}`);
+  }
+}
+
+/** 恢复一个保存的 session */
+async function resumeSession(sessionId: string): Promise<void> {
+  const messages = await loadSession(sessionId);
+  if (!messages) {
+    console.log(`${c.red}  Session not found: ${sessionId}${c.reset}`);
+    return;
+  }
+
+  // 重建：当前 system prompt + 旧消息
+  const systemMsg = conversationHistory[0];
+  conversationHistory = [systemMsg, ...messages];
+  currentSessionId = sessionId;
+
+  console.log(
+    `${c.green}  Resumed session: ${sessionId} (${messages.length} messages)${c.reset}\n`
+  );
+}
+
+/** 生成 session ID */
+function generateId(): string {
+  const now = new Date();
+  const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `${ts}_${rand}`;
 }
 
 // ──────────────────────────────────────────────
